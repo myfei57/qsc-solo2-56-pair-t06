@@ -159,6 +159,16 @@ def _door_page(platform: Platform) -> str:
         ]
         or [("暂无", "-")],
     )
+    maintenance = status.get("maintenance", {})
+    body += _table(
+        "检修窗口占用",
+        [
+            ("活动窗口总数", maintenance.get("windows", 0)),
+            ("按状态分布", maintenance.get("by_status", {})),
+            ("门控指令箱", maintenance.get("outbox", {})),
+            ("历史流水", "校验通过" if maintenance.get("history", {}).get("ok") else "异常"),
+        ],
+    )
     return _shell("门控控制台", body)
 
 

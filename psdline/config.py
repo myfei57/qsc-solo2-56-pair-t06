@@ -103,6 +103,22 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class MaintenanceSection:
+    """检修窗口（按站策略可在运行期单独覆盖，这里只给全局默认值）。"""
+
+    default_precedence: str = "service_first"
+    expire_grace_s: float = 900.0
+    service_buffer_s: float = 300.0
+    service_start_hour: int = 5
+    service_end_hour: int = 24
+    day_boundary_offset_s: int = 0
+    tz_offset_s: int = 0
+    max_window_s: float = 259_200.0
+    min_acceptable_s: float = 1200.0
+    horizon_s: float = 43_200.0
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +140,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    maintenance: MaintenanceSection = field(default_factory=MaintenanceSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +186,14 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.maintenance.default_precedence not in ("service_first", "maintenance_first"):
+            raise ConfigError("检修默认冲突策略只能是 service_first/maintenance_first", component="config")
+        if self.maintenance.expire_grace_s < 0 or self.maintenance.service_buffer_s < 0:
+            raise ConfigError("检修宽限期与接车避让余量不能为负", component="config")
+        if not 0 <= self.maintenance.service_start_hour < self.maintenance.service_end_hour <= 24:
+            raise ConfigError("运营时段必须满足 0 <= start < end <= 24", component="config")
+        if self.maintenance.max_window_s <= 0 or self.maintenance.min_acceptable_s <= 0:
+            raise ConfigError("检修窗口限值必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +238,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "maintenance": dict(config.maintenance.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +259,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        maintenance=_section(MaintenanceSection, payload.get("maintenance")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

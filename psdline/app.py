@@ -42,6 +42,11 @@ from .interlock import (
     restore_lockouts,
     verdict_of,
 )
+from .maintenance import (
+    ACTIVE as WIN_ACTIVE,
+    EXPIRED as WIN_EXPIRED,
+    MaintenanceService,
+)
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
@@ -134,6 +139,19 @@ class Platform:
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
+        self.maintenance = MaintenanceService(
+            store,
+            self.clock,
+            self.bus,
+            self.audit,
+            headways_provider=lambda station_id: list(
+                (self.schedules.get(station_id).headways if self.schedules.get(station_id) else [])
+            ),
+            group_provider=lambda station_id: [zone.id for zone in self._zone_ids(station_id)],
+        )
+        self.doors.set_maintenance_guard(lambda station_id, group_id: self.maintenance.group_inhibited(station_id, group_id))
+        self._apply_default_policies()
+
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
@@ -220,6 +238,38 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+
+    def _zone_ids(self, station_id: str) -> list:
+        """返回某站台全部门区（检修域校验门区归属时用）。"""
+
+        layout = self.layouts.get(station_id)
+        return list(layout.zones) if layout else []
+
+    def _apply_default_policies(self) -> None:
+        """把配置里的检修默认策略落到每个站台（已单独配置的站台不覆盖）。"""
+
+        section = self.config.maintenance
+        for station_id in self.namespace.station_ids():
+            from .maintenance import StationPolicy
+
+            existing = self.store.read(f"maintenance/{station_id}/policy")
+            if isinstance(existing, dict):
+                continue
+            self.maintenance._policies.save(
+                StationPolicy(
+                    station_id=station_id,
+                    precedence=section.default_precedence,
+                    expire_grace_s=section.expire_grace_s,
+                    service_buffer_s=section.service_buffer_s,
+                    service_start_hour=section.service_start_hour,
+                    service_end_hour=section.service_end_hour,
+                    day_boundary_offset_s=section.day_boundary_offset_s,
+                    tz_offset_s=section.tz_offset_s,
+                    max_window_s=section.max_window_s,
+                    min_acceptable_s=section.min_acceptable_s,
+                    horizon_s=section.horizon_s,
+                )
+            )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -666,6 +716,130 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    # ---- 检修窗口 -----------------------------------------------------
+
+    def maintenance_policy(self, station_id: str) -> dict:
+        """读取某站台的冲突策略。"""
+
+        return self.maintenance.get_policy(station_id).as_dict()
+
+    def set_maintenance_policy(self, station_id: str, actor: str = "supervisor", **fields) -> dict:
+        """按站设置冲突策略（运营优先 / 检修优先等）。"""
+
+        return self.maintenance.set_policy(station_id, actor=actor, **fields).as_dict()
+
+    def register_service_slot(
+        self,
+        station_id: str,
+        train_id: str,
+        arrive: float,
+        depart: float,
+        *,
+        actor: str = "dispatcher",
+    ) -> dict:
+        """登记一趟计划接车时段（排班冲突的权威来源）。"""
+
+        slot = self.maintenance.register_service(
+            station_id, train_id, arrive, depart, actor=actor
+        )
+        return {"ok": True, "slot": slot.as_dict(), "violations": []}
+
+    def analyze_maintenance(
+        self, station_id: str, group_id: str, start: float, end: float, *, kind: str = "routine"
+    ) -> dict:
+        """只做冲突分析与让路方案，不产生申请。"""
+
+        return self.maintenance.analyze(
+            station_id, group_id, float(start), float(end), kind=kind
+        )
+
+    def request_maintenance(
+        self,
+        station_id: str,
+        group_id: str,
+        start: float,
+        end: float,
+        applicant: str,
+        *,
+        kind: str = "routine",
+        reason: str = "",
+        ticket: str = "",
+        note: str = "",
+        idem_key: str = "",
+        actor: str = "applicant",
+    ) -> dict:
+        """按门区申请一个检修占用时段。"""
+
+        return self.maintenance.request_window(
+            station_id,
+            group_id,
+            float(start),
+            float(end),
+            applicant,
+            kind=kind,
+            reason=reason,
+            ticket=ticket,
+            note=note,
+            idem_key=idem_key,
+            actor=actor,
+        )
+
+    def approve_maintenance(self, window_id: str, actor: str, *, role: str = "dispatcher", force: bool = False) -> dict:
+        """审批检修窗口（冲突时按让路方案或紧急强制处理）。"""
+
+        return self.maintenance.approve_window(window_id, actor, role=role, force=force)
+
+    def reject_maintenance(self, window_id: str, actor: str, *, role: str = "dispatcher", note: str = "") -> dict:
+        return self.maintenance.reject_window(window_id, actor, role=role, note=note)
+
+    def start_maintenance(self, window_id: str, actor: str = "applicant") -> dict:
+        return self.maintenance.start_window(window_id, actor)
+
+    def finish_maintenance(self, window_id: str, actor: str, *, note: str = "") -> dict:
+        """现场完工确认，恢复自动开门。"""
+
+        return self.maintenance.finish_window(window_id, actor, note=note)
+
+    def force_finish_maintenance(
+        self, window_id: str, actor: str, *, role: str = "supervisor", confirm: str = "", note: str = ""
+    ) -> dict:
+        """值站主管对到期窗口强制收尾。"""
+
+        return self.maintenance.force_finish_window(
+            window_id, actor, role=role, confirm=confirm, note=note
+        )
+
+    def cancel_maintenance(self, window_id: str, actor: str, *, note: str = "") -> dict:
+        return self.maintenance.cancel_window(window_id, actor, note=note)
+
+    def extend_maintenance(self, window_id: str, actor: str, new_end: float, *, role: str = "dispatcher") -> dict:
+        return self.maintenance.extend_window(window_id, actor, float(new_end), role=role)
+
+    def maintenance_occupancy(self, station_id: str, start: float, end: float) -> dict:
+        """统一占用视图：门控、排班、锁定、审计共读这一份。"""
+
+        return self.maintenance.occupancy(station_id, float(start), float(end))
+
+    def maintenance_windows(self, station_id: str = "", *, statuses=None) -> dict:
+        return {"windows": [item.as_dict() for item in self.maintenance.list_windows(station_id, statuses=statuses)]}
+
+    def maintenance_window_view(self, window_id: str) -> dict:
+        return self.maintenance.window_view(window_id)
+
+    def maintenance_relay(self) -> dict:
+        return self.maintenance.relay()
+
+    def maintenance_reconcile(self) -> dict:
+        return self.maintenance.reconcile()
+
+    def maintenance_outbox(self) -> dict:
+        return self.maintenance.outbox_summary()
+
+    def maintenance_verify(self) -> dict:
+        """校验事件流水哈希链（历史不可变）。"""
+
+        return self.maintenance.verify_history()
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -675,6 +849,9 @@ class Platform:
             return {"ok": False, "violations": ["步长必须为正"], "cycle": self._cycles}
         self._cycles += 1
         moment = self.clock.now()
+        # 检修窗口时间驱动：到点开工、到期转 EXPIRED、宽限期满升级，并顺带投递
+        # 门控设备指令（失败留给下周期对账补偿）。
+        maintenance_tick = self.maintenance.tick(moment)
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
@@ -697,6 +874,7 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "maintenance": maintenance_tick,
             "violations": [],
         }
 
@@ -748,6 +926,12 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "maintenance": {
+                "windows": len(self.maintenance.list_windows()),
+                "by_status": self._maintenance_status_counts(),
+                "outbox": self.maintenance.outbox_summary(),
+                "history": self.maintenance.verify_history(),
+            },
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }
@@ -808,6 +992,11 @@ class Platform:
             "groups": group_keys(self.mappings, station_id),
             "active_group": active_group(self.doors, station_id),
             "pressure": open_pressure(self.doors, station_id),
+            "maintenance_policy": self.maintenance.get_policy(station_id).as_dict(),
+            "zone_occupancy": {
+                zone.id: self.maintenance.group_inhibited(station_id, zone.id)
+                for zone in zones
+            },
         }
 
     def resolve_group(self, station_id: str, group_key: str) -> dict:
@@ -862,6 +1051,14 @@ class Platform:
 
         gates = self.gates.by_station(station_id)
         return gates[0] if gates else None
+
+    def _maintenance_status_counts(self) -> dict:
+        """统计各状态窗口数，供状态快照使用。"""
+
+        counts: dict[str, int] = {}
+        for window in self.maintenance.list_windows():
+            counts[window.status] = counts.get(window.status, 0) + 1
+        return dict(sorted(counts.items()))
 
     def _adjacent_sample(self) -> dict:
         """给快照提供一个相邻关系样例。"""

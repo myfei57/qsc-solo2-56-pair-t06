@@ -182,6 +182,89 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_maint_demo(args: argparse.Namespace) -> int:
+    """检修窗口端到端演示：撞车分析、让路、两种策略、占门拦截、到期人工释放。"""
+
+    storage_root = getattr(args, "storage_root", None) or tempfile.mkdtemp(prefix="psdline-maint-")
+    clock = ManualClock()
+    config = load_config(args.config) if getattr(args, "config", None) else default_config()
+    platform = build_platform(config, clock=clock, storage_root=storage_root)
+    platform.start()
+    station = args.station
+    t0 = clock.now()
+    report: dict = {"storage_root": storage_root, "steps": []}
+
+    def step(name: str, payload: object) -> None:
+        report["steps"].append({"step": name, "result": payload})
+
+    # 1) 两趟计划接车。
+    platform.register_service_slot(station, "K101", t0 + 3600, t0 + 3660)
+    platform.register_service_slot(station, "K103", t0 + 7200, t0 + 7260)
+
+    # 2) 撞车窗口分析：运营优先站给出让车方案。
+    conflict = platform.analyze_maintenance(station, "G01", t0 + 3300, t0 + 4200)
+    step(
+        "analyze_service_first",
+        {
+            "hard_conflicts": len(conflict["hard_conflicts"]),
+            "approvable": conflict["approvable"],
+            "proposals": [item["kind"] for item in conflict["proposals"]],
+        },
+    )
+
+    # 3) 挑一个无冲突时段申请并批准，门立即禁止自动开门。
+    requested = platform.request_maintenance(
+        station, "G01", t0 + 10_000, t0 + 10_600, "zhang", ticket="M-001", reason="门机检修"
+    )
+    window_id = requested["window_id"]
+    platform.approve_maintenance(window_id, "disp-li")
+    step("approved", {"window_id": window_id, "inhibited": platform.maintenance.group_inhibited(station, "G01")})
+
+    # 4) 占用期间到站开门被统一占用视图拦下。
+    arrival = platform.arrive("T77", station, 0)
+    step("arrive_blocked", {"ok": arrival["ok"], "violations": arrival["violations"]})
+
+    # 5) 时间推进：开工、到期。到期后门仍禁用，普通完工被拒。
+    clock.advance(10_000)
+    platform.cycle()
+    clock.advance(600)
+    platform.cycle()
+    step("expired_inhibited", platform.maintenance.group_inhibited(station, "G01"))
+
+    # 6) 主管二次确认强制收尾，门恢复。
+    released = platform.force_finish_maintenance(
+        window_id, "chief", role="supervisor", confirm=window_id
+    )
+    step("released", {"status": released["status"], "inhibited": platform.maintenance.group_inhibited(station, "G01")})
+
+    # 7) 另一站台切到检修优先：撞车变软冲突，方案含调整接车建议。
+    maintenance_station = "ST2"
+    platform.set_maintenance_policy(maintenance_station, precedence="maintenance_first")
+    platform.register_service_slot(maintenance_station, "K201", t0 + 3600, t0 + 3660)
+    maintenance_view = platform.analyze_maintenance(maintenance_station, "G01", t0 + 3500, t0 + 4000)
+    step(
+        "analyze_maintenance_first",
+        {
+            "hard_conflicts": len(maintenance_view["hard_conflicts"]),
+            "soft_conflicts": len(maintenance_view["soft_conflicts"]),
+            "approvable": maintenance_view["approvable"],
+            "adjust_train_proposals": [
+                item["affected_trains"]
+                for item in maintenance_view["proposals"]
+                if item["affected_trains"]
+            ],
+        },
+    )
+
+    report["history"] = platform.maintenance_verify()
+    report["outbox"] = platform.maintenance_outbox()
+    _dump(report)
+    if not report["history"]["ok"]:
+        print("事件流水校验失败", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    maint = sub.add_parser("maint-demo", help="跑一遍检修窗口完整流程（冲突/让路/占门/释放）", parents=[common])
+    maint.add_argument("--station", default="ST1")
+    maint.set_defaults(func=_cmd_maint_demo)
     return parser
 
 

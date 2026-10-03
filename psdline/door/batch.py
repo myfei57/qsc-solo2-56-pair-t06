@@ -28,6 +28,10 @@ def batch_open(
         if not gate_ids:
             skipped[group] = "gate_missing"
             continue
+        inhibition = controller.maintenance_inhibition(station_id, group)
+        if inhibition["inhibited"]:
+            skipped[group] = "maintenance_inhibited"
+            continue
         if any(controller.lockouts.is_locked(gate_id) for gate_id in gate_ids):
             skipped[group] = "locked"
             continue

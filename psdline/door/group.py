@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from ..errors import MappingError
+from ..errors import InterlockError, MappingError
 from ..platform import MappingRegistry
 from .door import DoorController
 
@@ -28,6 +28,15 @@ def open_group(
     if not gate_ids:
         raise MappingError(
             f"映射 {group_key} → {resolved} 在站台 {station_id} 找不到对应门区",
+            component="door",
+        )
+    # 检修占用是比联锁锁定更高一层的硬卡：占用期间（含已批准待开工、进行中、
+    # 已到期未完工确认）这一樘门不允许自动开门，与排班/锁定读同一份占用视图。
+    inhibition = controller.maintenance_inhibition(station_id, resolved)
+    if inhibition["inhibited"]:
+        raise InterlockError(
+            f"门区 {resolved} 处于检修占用，禁止自动开门：{inhibition['reason']}"
+            + (f"（窗口 {inhibition['window_id']}）" if inhibition.get("window_id") else ""),
             component="door",
         )
     locked = [gate_id for gate_id in gate_ids if controller.lockouts.is_locked(gate_id)]

@@ -47,6 +47,18 @@
   "audit": {
     "journal_segment": 512
   },
+  "maintenance": {
+    "default_precedence": "service_first",
+    "expire_grace_s": 900.0,
+    "service_buffer_s": 300.0,
+    "service_start_hour": 5,
+    "service_end_hour": 24,
+    "day_boundary_offset_s": 0,
+    "tz_offset_s": 0,
+    "max_window_s": 259200.0,
+    "min_acceptable_s": 1200.0,
+    "horizon_s": 43200.0
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

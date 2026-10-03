@@ -91,6 +91,26 @@ class Api:
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
+        # ---- 检修窗口 ----
+        add("GET", "/api/maintenance/policy/{stationID}", self._maintenance_policy)
+        add("POST", "/api/maintenance/policy", self._set_maintenance_policy)
+        add("GET", "/api/maintenance/windows", self._maintenance_windows)
+        add("GET", "/api/maintenance/windows/{windowID}", self._maintenance_window)
+        add("GET", "/api/maintenance/occupancy/{stationID}", self._maintenance_occupancy)
+        add("POST", "/api/maintenance/analyze", self._maintenance_analyze)
+        add("POST", "/api/maintenance/service", self._maintenance_service)
+        add("POST", "/api/maintenance/request", self._maintenance_request)
+        add("POST", "/api/maintenance/approve", self._maintenance_approve)
+        add("POST", "/api/maintenance/reject", self._maintenance_reject)
+        add("POST", "/api/maintenance/start", self._maintenance_start)
+        add("POST", "/api/maintenance/finish", self._maintenance_finish)
+        add("POST", "/api/maintenance/force-finish", self._maintenance_force_finish)
+        add("POST", "/api/maintenance/cancel", self._maintenance_cancel)
+        add("POST", "/api/maintenance/extend", self._maintenance_extend)
+        add("POST", "/api/maintenance/relay", self._maintenance_relay)
+        add("POST", "/api/maintenance/reconcile", self._maintenance_reconcile)
+        add("GET", "/api/maintenance/outbox", self._maintenance_outbox)
+        add("GET", "/api/maintenance/verify", self._maintenance_verify)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -264,3 +284,134 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 检修窗口 -----------------------------------------------------
+
+    def _maintenance_policy(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_policy(str(params.get("stationID", "")))
+
+    def _set_maintenance_policy(self, params: dict, body: dict) -> dict:
+        allowed = {
+            "precedence",
+            "expire_grace_s",
+            "service_buffer_s",
+            "service_start_hour",
+            "service_end_hour",
+            "day_boundary_offset_s",
+            "tz_offset_s",
+            "max_window_s",
+            "min_acceptable_s",
+            "horizon_s",
+        }
+        fields = {key: value for key, value in body.items() if key in allowed}
+        return self._platform.set_maintenance_policy(
+            _require(body, "station_id"), str(body.get("actor", "supervisor")), **fields
+        )
+
+    def _maintenance_windows(self, params: dict, body: dict) -> dict:
+        statuses = params.get("status", "")
+        parsed = {item.strip() for item in str(statuses).split(",") if item.strip()} or None
+        return self._platform.maintenance_windows(str(params.get("station_id", "")), statuses=parsed)
+
+    def _maintenance_window(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_window_view(str(params.get("windowID", "")))
+
+    def _maintenance_occupancy(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_occupancy(
+            str(params.get("stationID", "")),
+            _as_float(params, "start", 0.0),
+            _as_float(params, "end", 0.0),
+        )
+
+    def _maintenance_analyze(self, params: dict, body: dict) -> dict:
+        return self._platform.analyze_maintenance(
+            _require(body, "station_id"),
+            _require(body, "group_id"),
+            _as_float(body, "start", 0.0),
+            _as_float(body, "end", 0.0),
+            kind=str(body.get("kind", "routine")),
+        )
+
+    def _maintenance_service(self, params: dict, body: dict) -> dict:
+        return self._platform.register_service_slot(
+            _require(body, "station_id"),
+            _require(body, "train_id"),
+            _as_float(body, "arrive", 0.0),
+            _as_float(body, "depart", 0.0),
+            actor=str(body.get("actor", "dispatcher")),
+        )
+
+    def _maintenance_request(self, params: dict, body: dict) -> dict:
+        return self._platform.request_maintenance(
+            _require(body, "station_id"),
+            _require(body, "group_id"),
+            _as_float(body, "start", 0.0),
+            _as_float(body, "end", 0.0),
+            _require(body, "applicant"),
+            kind=str(body.get("kind", "routine")),
+            reason=str(body.get("reason", "")),
+            ticket=str(body.get("ticket", "")),
+            note=str(body.get("note", "")),
+            idem_key=str(body.get("idem_key", "")),
+            actor=str(body.get("actor", "applicant")),
+        )
+
+    def _maintenance_approve(self, params: dict, body: dict) -> dict:
+        return self._platform.approve_maintenance(
+            _require(body, "window_id"),
+            _require(body, "actor"),
+            role=str(body.get("role", "dispatcher")),
+            force=bool(body.get("force", False)),
+        )
+
+    def _maintenance_reject(self, params: dict, body: dict) -> dict:
+        return self._platform.reject_maintenance(
+            _require(body, "window_id"),
+            _require(body, "actor"),
+            role=str(body.get("role", "dispatcher")),
+            note=str(body.get("note", "")),
+        )
+
+    def _maintenance_start(self, params: dict, body: dict) -> dict:
+        return self._platform.start_maintenance(
+            _require(body, "window_id"), str(body.get("actor", "applicant"))
+        )
+
+    def _maintenance_finish(self, params: dict, body: dict) -> dict:
+        return self._platform.finish_maintenance(
+            _require(body, "window_id"), _require(body, "actor"), note=str(body.get("note", ""))
+        )
+
+    def _maintenance_force_finish(self, params: dict, body: dict) -> dict:
+        return self._platform.force_finish_maintenance(
+            _require(body, "window_id"),
+            _require(body, "actor"),
+            role=str(body.get("role", "supervisor")),
+            confirm=str(body.get("confirm", "")),
+            note=str(body.get("note", "")),
+        )
+
+    def _maintenance_cancel(self, params: dict, body: dict) -> dict:
+        return self._platform.cancel_maintenance(
+            _require(body, "window_id"), _require(body, "actor"), note=str(body.get("note", ""))
+        )
+
+    def _maintenance_extend(self, params: dict, body: dict) -> dict:
+        return self._platform.extend_maintenance(
+            _require(body, "window_id"),
+            _require(body, "actor"),
+            _as_float(body, "new_end", 0.0),
+            role=str(body.get("role", "dispatcher")),
+        )
+
+    def _maintenance_relay(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_relay()
+
+    def _maintenance_reconcile(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_reconcile()
+
+    def _maintenance_outbox(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_outbox()
+
+    def _maintenance_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_verify()
