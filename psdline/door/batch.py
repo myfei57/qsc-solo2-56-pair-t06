@@ -28,6 +28,11 @@ def batch_open(
         if not gate_ids:
             skipped[group] = "gate_missing"
             continue
+        held = [gate_id for gate_id in gate_ids if controller.window_held(gate_id)]
+        if held:
+            # 检修占用的门不能进自动开门：先于联锁锁判定，跳过并明确记账。
+            skipped[group] = "maintenance_occupied"
+            continue
         if any(controller.lockouts.is_locked(gate_id) for gate_id in gate_ids):
             skipped[group] = "locked"
             continue

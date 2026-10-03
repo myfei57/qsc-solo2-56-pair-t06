@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from ..psd import LockoutRegistry, PSDRegistry
 from ..store import CommandLog, JsonStore
 from ..train import AlignRegistry
@@ -26,6 +28,8 @@ class DoorController:
         self._batch_limit = 64
         self._opens = 0
         self._closes = 0
+        # 检修窗口占用判定：(gate_id, moment) -> bool。未接线时恒为未占用。
+        self._window_held: Callable[[str], bool] = lambda gate_id: False
 
     @property
     def store(self) -> JsonStore:
@@ -58,6 +62,16 @@ class DoorController:
         """返回累计关门次数。"""
 
         return self._closes
+
+    def set_window_guard(self, held: Callable[[str], bool]) -> None:
+        """接入检修窗口占用判定，门控读同一份占用（不另存标志）。"""
+
+        self._window_held = held
+
+    def window_held(self, gate_id: str) -> bool:
+        """该门当前是否处于检修占用（占用期间禁止自动开门）。"""
+
+        return self._window_held(gate_id)
 
     def set_batch_limit(self, limit: int) -> None:
         """调整一次批量开门的门区上限。"""

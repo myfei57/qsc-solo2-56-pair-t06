@@ -47,6 +47,13 @@
   "audit": {
     "journal_segment": 512
   },
+  "window": {
+    "default_conflict_policy": "service_first",
+    "expiry_grace_s": 0.0,
+    "allow_force": false,
+    "search_horizon_s": 3600.0,
+    "station_policies": [["ST2", "maintenance_first"]]
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

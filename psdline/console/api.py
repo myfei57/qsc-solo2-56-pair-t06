@@ -73,6 +73,18 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
+        add("GET", "/api/windows", self._windows)
+        add("GET", "/api/windows/history", self._window_history)
+        add("GET", "/api/timetable/{stationID}", self._timetable)
+        add("POST", "/api/windows/apply", self._window_apply)
+        add("POST", "/api/windows/extend", self._window_extend)
+        add("POST", "/api/windows/activate", self._window_activate)
+        add("POST", "/api/windows/cancel", self._window_cancel)
+        add("POST", "/api/windows/complete", self._window_complete)
+        add("POST", "/api/windows/confirm", self._window_confirm)
+        add("POST", "/api/windows/tick", self._window_tick)
+        add("POST", "/api/windows/policy", self._window_policy)
+        add("POST", "/api/timetable", self._timetable_push)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
@@ -182,8 +194,83 @@ class Api:
             "quota_arrival": self._platform.quotas.status("arrival")["configured"],
             "quota_depart": self._platform.quotas.status("depart")["configured"],
             "audit_log": self._platform.audit.journal.count() >= 0,
+            "window_chain": self._platform.windows.verify()["consistent"],
         }
         return {"ready": all(checks.values()), "checks": checks}
+
+    # ---- 检修窗口 -----------------------------------------------------
+
+    def _windows(self, params: dict, body: dict) -> dict:
+        return self._platform.window_view(str(params.get("station_id", "")))
+
+    def _window_history(self, params: dict, body: dict) -> dict:
+        return {"history": [window.as_dict() for window in self._platform.windows.history()]}
+
+    def _timetable(self, params: dict, body: dict) -> dict:
+        station_id = str(params.get("stationID", ""))
+        timetable = self._platform.timetables.latest(station_id)
+        if timetable is None:
+            raise RailError(f"站台 {station_id} 没有接车时刻表", component="console")
+        revisions = self._platform.timetables.revisions(station_id)
+        return {"timetable": timetable.as_dict(), "revisions": revisions}
+
+    def _window_apply(self, params: dict, body: dict) -> dict:
+        gates = body.get("gate_ids")
+        if not isinstance(gates, list) or not gates:
+            raise RailError("gate_ids 必须是非空列表", component="console")
+        return self._platform.apply_window(
+            _require(body, "station_id"),
+            [str(item) for item in gates],
+            _as_float(body, "start_at", 0.0),
+            _as_float(body, "end_at", 0.0),
+            str(body.get("requested_by", "unknown")),
+            str(body.get("reason", "")),
+            force=bool(body.get("force", False)),
+        )
+
+    def _window_extend(self, params: dict, body: dict) -> dict:
+        return self._platform.extend_window(
+            _require(body, "window_id"),
+            _as_float(body, "end_at", 0.0),
+            str(body.get("requested_by", "unknown")),
+        )
+
+    def _window_cancel(self, params: dict, body: dict) -> dict:
+        return self._platform.cancel_window(
+            _require(body, "window_id"), str(body.get("requested_by", "unknown"))
+        )
+
+    def _window_complete(self, params: dict, body: dict) -> dict:
+        return self._platform.complete_window(
+            _require(body, "window_id"), str(body.get("requested_by", "unknown"))
+        )
+
+    def _window_confirm(self, params: dict, body: dict) -> dict:
+        return self._platform.confirm_window(
+            _require(body, "window_id"), str(body.get("closed_by", "unknown"))
+        )
+
+    def _window_tick(self, params: dict, body: dict) -> dict:
+        return self._platform.window_tick()
+
+    def _window_activate(self, params: dict, body: dict) -> dict:
+        return self._platform.activate_window(_require(body, "window_id"))
+
+    def _window_policy(self, params: dict, body: dict) -> dict:
+        return self._platform.set_station_window_policy(
+            _require(body, "station_id"),
+            _require(body, "conflict_policy"),
+            expiry_grace_s=_as_float(body, "expiry_grace_s", 0.0)
+            if "expiry_grace_s" in body
+            else None,
+            allow_force=bool(body.get("allow_force", False)) if "allow_force" in body else None,
+        )
+
+    def _timetable_push(self, params: dict, body: dict) -> dict:
+        visits = body.get("visits")
+        if not isinstance(visits, list):
+            raise RailError("visits 必须是列表", component="console")
+        return self._platform.seed_timetable(_require(body, "station_id"), visits)
 
     # ---- 动作 ---------------------------------------------------------
 

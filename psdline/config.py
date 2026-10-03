@@ -103,6 +103,33 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class WindowSection:
+    """门区检修窗口策略。
+
+    ``default_conflict_policy`` 是线路缺省裁决（保运营/保检修），各站可用
+    ``station_policies`` 覆盖；让路规划只在 ``search_horizon_s`` 内找平移空档。
+    """
+
+    default_conflict_policy: str = "service_first"
+    expiry_grace_s: float = 0.0
+    allow_force: bool = False
+    search_horizon_s: float = 3600.0
+    station_policies: tuple[tuple[str, str], ...] = ()
+
+    def as_policies(self) -> dict[str, "StationWindowPolicy"]:
+        from .window import StationWindowPolicy
+
+        return {
+            station_id: StationWindowPolicy(
+                conflict_policy=policy,
+                expiry_grace_s=self.expiry_grace_s,
+                allow_force=self.allow_force,
+            )
+            for station_id, policy in self.station_policies
+        }
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +151,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    window: WindowSection = field(default_factory=WindowSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +197,15 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.window.default_conflict_policy not in ("service_first", "maintenance_first"):
+            raise ConfigError("窗口缺省策略必须是 service_first 或 maintenance_first", component="config")
+        if self.window.expiry_grace_s < 0:
+            raise ConfigError("窗口到期宽限不能为负", component="config")
+        if self.window.search_horizon_s <= 0:
+            raise ConfigError("让路规划搜索时长必须为正", component="config")
+        for station_id, policy in self.window.station_policies:
+            if policy not in ("service_first", "maintenance_first"):
+                raise ConfigError(f"站台 {station_id} 窗口策略非法: {policy}", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -189,6 +226,13 @@ def _section(cls, payload: object):
     kwargs = {key: value for key, value in payload.items() if key in known}
     if cls is NamespaceSection and "stations" in kwargs:
         kwargs["stations"] = tuple(str(item) for item in kwargs["stations"])
+    if cls is WindowSection and "station_policies" in kwargs:
+        raw = kwargs["station_policies"]
+        if not isinstance(raw, list):
+            raise ConfigError("station_policies 必须是 [站台, 策略] 列表", component="config")
+        kwargs["station_policies"] = tuple(
+            (str(item[0]), str(item[1])) for item in raw if isinstance(item, (list, tuple)) and len(item) == 2
+        )
     return cls(**kwargs)
 
 
@@ -213,6 +257,10 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "window": {
+            **dict(config.window.__dict__),
+            "station_policies": [list(item) for item in config.window.station_policies],
+        },
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +281,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        window=_section(WindowSection, payload.get("window")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

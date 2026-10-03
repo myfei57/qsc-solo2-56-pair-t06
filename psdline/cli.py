@@ -8,6 +8,10 @@
             前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
+``windows`` 打印门区检修窗口视图（当前占用、挂账、策略、哈希链）；
+``window-demo``
+            用可推进时钟跑一遍检修窗口全流程（撞排班被拒给让路方案、保检修站改点
+            批准、占用期间自动开门被闸、到点自动释放、人工销账、并发申请与回滚）；
 ``reset``   清掉落盘的平台计数。
 """
 
@@ -175,6 +179,33 @@ def _cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_windows(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    _dump(platform.window_view(getattr(args, "station", "") or ""))
+    return 0
+
+
+def _cmd_window_demo(args: argparse.Namespace) -> int:
+    from .window_demo import run_window_demo
+
+    clock = ManualClock()
+    config_path = getattr(args, "config", None)
+    config = load_config(config_path) if config_path else default_config()
+    storage_root = getattr(args, "storage_root", None) or tempfile.mkdtemp(prefix="psdline-win-")
+    platform = build_platform(config, clock=clock, storage_root=storage_root)
+    report = run_window_demo(platform, clock)
+    _dump({"storage_root": storage_root, **report})
+    failures = [
+        f"{name}:{detail}"
+        for name, ok, detail in report["checks"]
+        if not ok
+    ]
+    if failures:
+        print(f"检查未通过: {failures}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_reset(args: argparse.Namespace) -> int:
     platform = _build(args)
     removed = platform.reset_state()
@@ -213,6 +244,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)
+
+    windows = sub.add_parser("windows", help="打印检修窗口视图", parents=[common])
+    windows.add_argument("--station", default="", help="只看某个站台")
+    windows.set_defaults(func=_cmd_windows)
+
+    window_demo = sub.add_parser("window-demo", help="跑一遍检修窗口全流程", parents=[common])
+    window_demo.set_defaults(func=_cmd_window_demo)
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from ..errors import MappingError
+from ..errors import InterlockError, MappingError
 from ..platform import MappingRegistry
 from .door import DoorController
 
@@ -29,6 +29,12 @@ def open_group(
         raise MappingError(
             f"映射 {group_key} → {resolved} 在站台 {station_id} 找不到对应门区",
             component="door",
+        )
+    held = [gate_id for gate_id in gate_ids if controller.window_held(gate_id)]
+    if held:
+        raise InterlockError(
+            f"门区 {resolved} 处于检修占用，禁止自动开门: {','.join(held)}",
+            component="window",
         )
     locked = [gate_id for gate_id in gate_ids if controller.lockouts.is_locked(gate_id)]
     if locked:

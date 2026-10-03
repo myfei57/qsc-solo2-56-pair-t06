@@ -72,6 +72,16 @@ from .train import (
     TrainRegistry,
     train_state,
 )
+from .window import (
+    ConflictFinder,
+    StationWindowPolicy,
+    TimetableRegistry,
+    TrainVisit,
+    WindowService,
+    WindowStore,
+    YieldPlanner,
+)
+from .window.service import LockApplier
 
 ARRIVAL = "arrival"
 DEPART = "depart"
@@ -134,6 +144,18 @@ class Platform:
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
+        # 门区检修窗口：哈希链事件流水 + 接车时刻表版本，门控读同一份占用。
+        self.window_store = WindowStore(store)
+        self.timetables = TimetableRegistry(store)
+        self.windows = WindowService(
+            self.window_store,
+            self.timetables,
+            self.clock,
+            finder=ConflictFinder(),
+            planner=YieldPlanner(search_horizon_s=self.config.window.search_horizon_s),
+        )
+        self._wire_window_service()
+
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
@@ -146,6 +168,93 @@ class Platform:
         """统计总线事件，供状态接口判断动作有没有真的流过组件。"""
 
         self._event_counts[event.topic] = self._event_counts.get(event.topic, 0) + 1
+
+    def _wire_window_service(self) -> None:
+        """把窗口服务接到平台：策略、门清单、审计、事件总线与门体联动。
+
+        联动只做两件事：占用生效时把门锁在关闭位（联锁锁，自动开门会跳过），
+        释放时解锁。门控侧"是否占用"永远现查窗口服务，不缓存第二份标志。
+        """
+
+        section = self.config.window
+        self.windows.set_default_policy(
+            StationWindowPolicy(
+                conflict_policy=section.default_conflict_policy,
+                expiry_grace_s=section.expiry_grace_s,
+                allow_force=section.allow_force,
+            )
+        )
+        for station_id, policy in section.as_policies().items():
+            self.windows.set_station_policy(station_id, policy)
+        self.windows.gate_lister = lambda station_id: [
+            gate.id for gate in self.gates.by_station(station_id)
+        ]
+        self.windows.audit = lambda kind, station_id, **detail: self.audit.record(
+            kind, "", station_id, at=self.clock.now(), **detail
+        )
+        self.windows.publish = lambda area, device, action: self.bus.publish(
+            Event.of(area, device, action, severity="notice")
+        )
+
+        def lock_applier(gate_ids, locked, window) -> list[str]:
+            affected: list[str] = []
+            for gate_id in gate_ids:
+                if self.lockouts.is_locked(gate_id) == locked:
+                    continue
+                self.lockouts.set(gate_id, locked)
+                # 释放时顺手收回关闭位；上锁时绝不替现场开门。
+                if not locked:
+                    self.gates.set_open(gate_id, False)
+                affected.append(gate_id)
+            self.bus.publish(
+                Event.of(
+                    "window",
+                    "lock",
+                    "locked" if locked else "released",
+                    severity="alarm" if locked else "notice",
+                    station_id=window.station_id,
+                    window_id=window.id,
+                    gates=",".join(affected),
+                )
+            )
+            return affected
+
+        self.windows.lock_applier = lock_applier
+        self.doors.set_window_guard(self.windows.is_gate_held)
+
+    def _seed_window_timetables(self, store: JsonStore) -> None:
+        """播种一份演示/标定用接车时刻表（每个站未来若干班，按 20 分钟节奏）。
+
+        只在没有任何时刻表版本时执行；现场接入真实排班后由调度接口推新版本。
+        """
+
+        if self.timetables.revisions(self.namespace.station_ids()[0]):
+            return
+        origin = self.clock.now()
+        groups = [f"G{index:02d}" for index in range(1, self.config.station.groups_per_station + 1)]
+        for offset, station_id in enumerate(self.namespace.station_ids()):
+            station_gates = self.gates.by_station(station_id)
+            visits = []
+            for index in range(1, 9):
+                # 奇偶班交错停不同门区，让检修申请存在"换门"这条让路路径；
+                # 班距 30 分钟，班后留出可整组平移的检修空档。
+                stop_groups = groups[:2] if index % 2 else groups[2:]
+                gate_ids = tuple(
+                    gate.id for gate in station_gates if gate.group in stop_groups
+                )
+                arrive = origin + 600 + (index - 1) * 1800 + offset * 120
+                visits.append(
+                    TrainVisit(
+                        train_id=f"T{index:02d}",
+                        station_id=station_id,
+                        arrive_at=arrive,
+                        depart_at=arrive + 45,
+                        gate_ids=gate_ids,
+                        track=f"{self.namespace.line_id()}-{station_id}",
+                    )
+                )
+            self.windows.seed_timetable(station_id, visits, note="平台播种初始接车计划")
+        store.write("window/timetable/seed", {"origin": origin})
 
     # ---- 装配 ---------------------------------------------------------
 
@@ -211,6 +320,7 @@ class Platform:
             seed_doc,
             {"line": self.namespace.line_id(), "stations": self.namespace.station_ids()},
         )
+        self._seed_window_timetables(store)
 
     def _restore(self) -> None:
         """从落盘状态恢复操作计数与锁定状态。"""
@@ -666,6 +776,124 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    # ---- 检修窗口 -----------------------------------------------------
+
+    def apply_window(
+        self,
+        station_id: str,
+        gate_ids: list[str],
+        start_at: float,
+        end_at: float,
+        requested_by: str,
+        reason: str = "",
+        force: bool = False,
+    ) -> dict:
+        """申请门区检修占用；冲突时按站策略裁决并携带让路方案。"""
+
+        return self.windows.apply_window(
+            station_id, list(gate_ids), start_at, end_at, requested_by, reason, force=force
+        )
+
+    def extend_window(self, window_id: str, new_end_at: float, requested_by: str) -> dict:
+        """续窗：新止点前的冲突照常检测。"""
+
+        return self.windows.extend_window(window_id, new_end_at, requested_by)
+
+    def cancel_window(self, window_id: str, requested_by: str) -> dict:
+        """取消未到点窗口。"""
+
+        return self.windows.cancel(window_id, requested_by)
+
+    def complete_window(self, window_id: str, requested_by: str) -> dict:
+        """现场提前完工：立即释放门体，仍需事后销账。"""
+
+        return self.windows.complete_early(window_id, requested_by)
+
+    def confirm_window(self, window_id: str, closed_by: str) -> dict:
+        """人工销账：挂账窗口进入不可变历史。"""
+
+        return self.windows.confirm_close(window_id, closed_by)
+
+    def window_tick(self) -> dict:
+        """手动推进一次到点扫描（控制周期也会自动调）。"""
+
+        return self.windows.tick()
+
+    def activate_window(self, window_id: str) -> dict:
+        """在窗口时段内手动置为占用（正常由控制周期自动到点）。"""
+
+        return self.windows.activate(window_id)
+
+    def window_view(self, station_id: str = "") -> dict:
+        """窗口综合视图：当前窗口、挂账、占用映射、策略与哈希链校验。"""
+
+        moment = self.clock.now()
+        live = self.windows.windows(station_id=station_id)
+        occupancy = self.windows.occupancy_at(moment)
+        return {
+            "utc": self.clock.utc_iso(),
+            "at": moment,
+            "policies": self.windows.policies() if not station_id else {
+                "default": self.windows.policies()["default"],
+                "stations": {station_id: self.windows.policy_of(station_id).as_dict()},
+            },
+            "windows": [window.as_dict() for window in live],
+            "unconfirmed": [
+                window.id for window in live if window.status == "expired_unconfirmed"
+            ],
+            "occupancy": {
+                gate_id: record.as_dict() for gate_id, record in sorted(occupancy.items())
+            },
+            "held_gates": sorted(occupancy),
+            "history": [window.as_dict() for window in self.windows.history()],
+            "chain": self.windows.verify(),
+            "chain_error": (
+                error.message if (error := self.windows.chain_error()) is not None else ""
+            ),
+        }
+
+    def set_station_window_policy(
+        self,
+        station_id: str,
+        conflict_policy: str,
+        expiry_grace_s: float | None = None,
+        allow_force: bool | None = None,
+    ) -> dict:
+        """运行期调整某个站的窗口策略（落审计）。"""
+
+        current = self.windows.policy_of(station_id)
+        policy = StationWindowPolicy(
+            conflict_policy=conflict_policy,
+            expiry_grace_s=current.expiry_grace_s if expiry_grace_s is None else expiry_grace_s,
+            allow_force=current.allow_force if allow_force is None else allow_force,
+        )
+        self.windows.set_station_policy(station_id, policy)
+        self.audit.record(
+            "window_policy_change",
+            "",
+            station_id,
+            conflict_policy=conflict_policy,
+            expiry_grace_s=policy.expiry_grace_s,
+            allow_force=policy.allow_force,
+        )
+        return {"ok": True, "station_id": station_id, "policy": policy.as_dict(), "violations": []}
+
+    def seed_timetable(self, station_id: str, visits: list[dict]) -> dict:
+        """写入/替换接车时刻表的下一版本（调度对接入口）。"""
+
+        parsed = [
+            TrainVisit(
+                train_id=str(item["train_id"]),
+                station_id=station_id,
+                arrive_at=float(item["arrive_at"]),
+                depart_at=float(item["depart_at"]),
+                gate_ids=tuple(str(gate) for gate in item.get("gate_ids", [])),
+                track=str(item.get("track", "")),
+            ).validate()
+            for item in visits
+        ]
+        return self.windows.seed_timetable(station_id, parsed, note="调度接口推送")
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -675,6 +903,7 @@ class Platform:
             return {"ok": False, "violations": ["步长必须为正"], "cycle": self._cycles}
         self._cycles += 1
         moment = self.clock.now()
+        window_tick = self.windows.tick(moment)
         stale = [
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
@@ -697,6 +926,10 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "window_tick": {
+                "activated": window_tick["activated"],
+                "expired": window_tick["expired"],
+            },
             "violations": [],
         }
 
@@ -707,6 +940,7 @@ class Platform:
 
         trains = self.trains.list()
         ids = [train.id for train in trains]
+        moment = self.clock.now()
         return {
             "platform": self.config.name,
             "unit": self.unit,
@@ -748,6 +982,12 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "windows": {
+                "live": len(self.windows.windows()),
+                "unconfirmed": len(self.windows.windows(status="expired_unconfirmed")),
+                "held_gates": self.windows.held_gates(moment),
+                "history": len(self.windows.history()),
+            },
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }
@@ -773,6 +1013,7 @@ class Platform:
                 for station_id in self.namespace.station_ids()
             },
             "adjacent": self._adjacent_sample(),
+            "windows": self.window_view(),
             "timeline": build_timeline(self.audit.list(), limit=20),
         }
 
